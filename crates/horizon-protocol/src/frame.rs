@@ -47,6 +47,17 @@ pub fn contents(body: &[u8], threshold: Option<usize>) -> Result<Vec<u8>> {
     Ok(inner)
 }
 
+/// How many bytes the VarInt length prefix of `len` content bytes takes.
+pub fn varint_len(len: usize) -> usize {
+    match len {
+        0..=0x7F => 1,
+        0x80..=0x3FFF => 2,
+        0x4000..=0x1F_FFFF => 3,
+        0x20_0000..=0xFFF_FFFF => 4,
+        _ => 5,
+    }
+}
+
 /// A frame: the length prefix, then the [`contents`].
 pub fn prefixed(contents: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(contents.len() + 3);
@@ -55,9 +66,9 @@ pub fn prefixed(contents: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Split one complete frame off the front of `buffer`, if available.
-/// Returns the frame contents (without the length prefix).
-pub fn split(buffer: &mut Vec<u8>) -> Result<Option<Vec<u8>>> {
+/// The first complete frame at the front of `buffer`, if one is there: where its contents
+/// start (after the length prefix) and how long they are.
+pub fn find(buffer: &[u8]) -> Result<Option<(usize, usize)>> {
     let mut len = 0usize;
     for i in 0..3 {
         let Some(&b) = buffer.get(i) else {
@@ -74,23 +85,41 @@ pub fn split(buffer: &mut Vec<u8>) -> Result<Option<Vec<u8>>> {
             if buffer.len() < start + len {
                 return Ok(None);
             }
-            let frame = buffer[start..start + len].to_vec();
-            buffer.drain(..start + len);
-            return Ok(Some(frame));
+            return Ok(Some((start, len)));
         }
     }
     Err(Error::new("length wider than 21 bits"))
 }
 
+/// Split one complete frame off the front of `buffer`, if available.
+/// Returns the frame contents (without the length prefix).
+pub fn split(buffer: &mut Vec<u8>) -> Result<Option<Vec<u8>>> {
+    let Some((start, len)) = find(buffer)? else {
+        return Ok(None);
+    };
+    let frame = buffer[start..start + len].to_vec();
+    buffer.drain(..start + len);
+    Ok(Some(frame))
+}
+
 /// Undo compression on a frame, giving the packet body (id + payload).
 pub fn decompress(frame: Vec<u8>, threshold: Option<usize>) -> Result<Vec<u8>> {
-    let Some(threshold) = threshold else {
+    if threshold.is_none() {
         return Ok(frame);
+    }
+    decompressed(&frame, threshold).map(std::borrow::Cow::into_owned)
+}
+
+/// [`decompress`] without a copy where none is needed: an uncompressed frame's body is a
+/// part of the frame itself.
+pub fn decompressed(frame: &[u8], threshold: Option<usize>) -> Result<std::borrow::Cow<'_, [u8]>> {
+    let Some(threshold) = threshold else {
+        return Ok(std::borrow::Cow::Borrowed(frame));
     };
-    let mut r = Reader::new(&frame);
+    let mut r = Reader::new(frame);
     let size = r.varint()?;
     if size == 0 {
-        return Ok(frame[r.position()..].to_vec());
+        return Ok(std::borrow::Cow::Borrowed(&frame[r.position()..]));
     }
     let size = usize::try_from(size).map_err(|_| Error::new("negative uncompressed length"))?;
     if size < threshold {
@@ -114,7 +143,7 @@ pub fn decompress(frame: Vec<u8>, threshold: Option<usize>) -> Result<Vec<u8>> {
             out.len()
         )));
     }
-    Ok(out)
+    Ok(std::borrow::Cow::Owned(out))
 }
 
 #[cfg(test)]

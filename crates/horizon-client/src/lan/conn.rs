@@ -1435,7 +1435,15 @@ fn write_loop(
                 }
             }
             Ok(Out::Packets(bodies)) => {
-                if !bodies.into_iter().all(&mut write) {
+                // A tick's packets leave in one write (horizon_protocol's batch).
+                writer.begin_batch();
+                let mut write = |body: Vec<u8>| {
+                    pending.fetch_sub(body.len(), Ordering::Relaxed);
+                    send_body(&mut writer, &body).is_ok()
+                        && pending.load(Ordering::Relaxed) <= MAX_PENDING
+                };
+                let sent = bodies.into_iter().all(&mut write);
+                if writer.end_batch().is_err() || !sent {
                     break;
                 }
             }

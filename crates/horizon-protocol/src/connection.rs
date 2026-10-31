@@ -9,7 +9,7 @@ use std::{
     net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs},
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicI64, Ordering},
+        atomic::{AtomicI64, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -42,8 +42,9 @@ impl Drop for End {
 /// One end of an in-memory byte pipe: what one end writes the other reads.
 pub struct Pipe {
     end: Arc<End>,
-    /// The read timeout (`set_read_timeout`).
-    timeout: Mutex<Option<Duration>>,
+    /// The read timeout (`set_read_timeout`) in nanoseconds, 0 for none: read on every
+    /// read, without a lock.
+    timeout: AtomicU64,
 }
 impl Pipe {
     /// Two connected ends.
@@ -51,15 +52,22 @@ impl Pipe {
         let (a, b) = (Arc::new(Channel::default()), Arc::new(Channel::default()));
         let end = |incoming, outgoing| Self {
             end: Arc::new(End { incoming, outgoing }),
-            timeout: Mutex::new(None),
+            timeout: AtomicU64::new(0),
         };
         (end(a.clone(), b.clone()), end(b, a))
     }
     fn try_clone(&self) -> Self {
         Self {
             end: self.end.clone(),
-            timeout: Mutex::new(*self.timeout.lock().unwrap()),
+            timeout: AtomicU64::new(self.timeout.load(Ordering::Relaxed)),
         }
+    }
+    fn set_timeout(&self, timeout: Option<Duration>) {
+        // A zero timeout is refused by sockets; here it is none, as `None` is.
+        let nanos = timeout.map_or(0, |t| {
+            u64::try_from(t.as_nanos()).unwrap_or(u64::MAX).max(1)
+        });
+        self.timeout.store(nanos, Ordering::Relaxed);
     }
     /// Close both directions: reads at either end then see the end of the stream.
     pub fn shutdown(&self) {
@@ -69,7 +77,10 @@ impl Pipe {
 }
 impl Read for Pipe {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-        let deadline = self.timeout.lock().unwrap().map(|t| Instant::now() + t);
+        let deadline = match self.timeout.load(Ordering::Relaxed) {
+            0 => None,
+            nanos => Some(Instant::now() + Duration::from_nanos(nanos)),
+        };
         let mut state = self.end.incoming.state.lock().unwrap();
         while state.0.is_empty() && !state.1 {
             state = match deadline {
@@ -84,9 +95,12 @@ impl Read for Pipe {
             };
         }
         let n = out.len().min(state.0.len());
-        for (o, b) in out.iter_mut().zip(state.0.drain(..n)) {
-            *o = b;
-        }
+        // The queue's two halves, copied whole rather than byte by byte.
+        let (front, back) = state.0.as_slices();
+        let first = n.min(front.len());
+        out[..first].copy_from_slice(&front[..first]);
+        out[first..n].copy_from_slice(&back[..n - first]);
+        state.0.drain(..n);
         Ok(n)
     }
 }
@@ -96,8 +110,13 @@ impl Write for Pipe {
         if state.1 {
             return Err(std::io::ErrorKind::BrokenPipe.into());
         }
+        // The reader waits only while the queue is empty: bytes added to waiting ones have
+        // woken it already, and a wake is a system call.
+        let woke = !state.0.is_empty();
         state.0.extend(data);
-        self.end.outgoing.ready.notify_all();
+        if !woke {
+            self.end.outgoing.ready.notify_all();
+        }
         Ok(data.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -121,7 +140,7 @@ impl Stream {
         match self {
             Self::Tcp(s) => s.set_read_timeout(timeout),
             Self::Memory(p) => {
-                *p.timeout.lock().unwrap() = timeout;
+                p.set_timeout(timeout);
                 Ok(())
             }
         }
@@ -169,7 +188,11 @@ pub struct Counters {
 
 pub struct ConnReader {
     stream: Stream,
+    /// Bytes read and decrypted; frames are taken from `start` on.
     buffer: Vec<u8>,
+    /// Where the bytes no frame took yet begin. Frames are taken without moving what follows
+    /// them; the taken bytes are dropped once no whole frame is left, before the next read.
+    start: usize,
     decrypt: Option<Cfb8>,
     pub threshold: Option<usize>,
     pub counters: Arc<Counters>,
@@ -187,6 +210,8 @@ pub struct ConnWriter {
     encrypt: Option<Cfb8>,
     pub threshold: Option<usize>,
     counters: Arc<Counters>,
+    /// Frames held for one write ([`Self::begin_batch`]), framed and encrypted in order.
+    batch: Option<Vec<u8>>,
 }
 /// `InetAddress.getByName` under Java's default `java.net.preferIPv6Addresses=false`: IPv4
 /// addresses first, whatever order the system resolver gives (macOS lists IPv6 first). Vanilla
@@ -281,6 +306,7 @@ impl Connection {
             reader: ConnReader {
                 stream,
                 buffer: Vec::new(),
+                start: 0,
                 decrypt: None,
                 threshold: None,
                 counters: counters.clone(),
@@ -290,6 +316,7 @@ impl Connection {
                 encrypt: None,
                 threshold: None,
                 counters,
+                batch: None,
             },
         })
     }
@@ -307,7 +334,8 @@ impl Connection {
     pub fn enable_encryption(&mut self, secret: &[u8; 16]) {
         let mut decrypt = Cfb8::new(secret, secret);
         // Bytes already read past the last packet were sent encrypted.
-        decrypt.decrypt(&mut self.reader.buffer);
+        let start = self.reader.start;
+        decrypt.decrypt(&mut self.reader.buffer[start..]);
         self.reader.decrypt = Some(decrypt);
         self.writer.encrypt = Some(Cfb8::new(secret, secret));
     }
@@ -331,8 +359,10 @@ impl ConnReader {
     /// Block until a whole packet arrives: (id, payload).
     pub fn recv(&mut self) -> Result<(i32, Vec<u8>)> {
         loop {
-            if let Some(frame) = frame::split(&mut self.buffer)? {
-                let body = frame::decompress(frame, self.threshold)?;
+            if let Some((at, len)) = frame::find(&self.buffer[self.start..])? {
+                let contents = self.start + at..self.start + at + len;
+                self.start = contents.end;
+                let body = frame::decompressed(&self.buffer[contents], self.threshold)?;
                 if body.is_empty() {
                     // A frame with no packet in it. Vanilla's PacketDecoder
                     // only decodes a packet from a readable buffer, so an
@@ -345,6 +375,11 @@ impl ConnReader {
                 let start = r.position();
                 self.counters.received.fetch_add(1, Ordering::Relaxed);
                 return Ok((id, body[start..].to_vec()));
+            }
+            // Only part of a frame is left: drop what the frames took before reading more.
+            if self.start > 0 {
+                self.buffer.drain(..self.start);
+                self.start = 0;
             }
             let mut chunk = [0u8; 16384];
             let n = match self.stream.read(&mut chunk) {
@@ -395,16 +430,45 @@ impl ConnWriter {
     /// Send a frame whose contents [`frame::contents`] made with this
     /// writer's threshold.
     pub fn send_contents(&mut self, contents: &[u8]) -> Result<()> {
-        let mut framed = frame::prefixed(contents);
-        if let Some(c) = &mut self.encrypt {
-            c.encrypt(&mut framed);
+        let length = frame::varint_len(contents.len());
+        let frame_len = length + contents.len();
+        match &mut self.batch {
+            Some(batch) => {
+                // Framed straight into the batch: CFB8 is a stream cipher, so the frames
+                // encrypted one after another are the bytes the batch's one write sends.
+                let at = batch.len();
+                batch.reserve(frame_len);
+                crate::buf::write_varint(batch, contents.len() as i32);
+                batch.extend_from_slice(contents);
+                if let Some(c) = &mut self.encrypt {
+                    c.encrypt(&mut batch[at..]);
+                }
+            }
+            None => {
+                let mut framed = frame::prefixed(contents);
+                if let Some(c) = &mut self.encrypt {
+                    c.encrypt(&mut framed);
+                }
+                self.stream.write_all(&framed)?;
+            }
         }
-        self.stream.write_all(&framed)?;
         self.counters.sent.fetch_add(1, Ordering::Relaxed);
         self.counters
             .bytes_out
-            .fetch_add(framed.len() as i64, Ordering::Relaxed);
+            .fetch_add(frame_len as i64, Ordering::Relaxed);
         Ok(())
+    }
+    /// Hold the frames sent from now on until [`Self::end_batch`] writes them at once: one
+    /// system call (and on TCP a few full segments) for a tick's packets, not one each.
+    pub fn begin_batch(&mut self) {
+        self.batch.get_or_insert_with(Vec::new).clear();
+    }
+    /// Write the frames held since [`Self::begin_batch`], and stop holding them.
+    pub fn end_batch(&mut self) -> Result<()> {
+        match self.batch.take() {
+            Some(batch) if !batch.is_empty() => Ok(self.stream.write_all(&batch)?),
+            _ => Ok(()),
+        }
     }
     pub fn shutdown(&self) {
         self.stream.shutdown();
@@ -596,6 +660,137 @@ mod tests {
         drop(b);
         assert!(c.recv().is_err());
         assert!(c.send(&[1]).is_err());
+    }
+
+    /// Bytes come out of a pipe in order across the queue's wrap-around, in reads of any size.
+    #[test]
+    fn a_pipe_keeps_byte_order_across_its_wrap() {
+        let (mut a, mut b) = Pipe::pair();
+        let mut expected = Vec::new();
+        let mut got = Vec::new();
+        let mut next = 0u8;
+        for round in 0..200usize {
+            let chunk: Vec<u8> = (0..(round * 7) % 61 + 1)
+                .map(|_| {
+                    next = next.wrapping_add(1);
+                    next
+                })
+                .collect();
+            a.write_all(&chunk).unwrap();
+            expected.extend_from_slice(&chunk);
+            // Read less than is there, so the queue's head moves around its buffer.
+            let mut out = [0u8; 13];
+            let n = b.read(&mut out[..(round % 13) + 1]).unwrap();
+            got.extend_from_slice(&out[..n]);
+        }
+        drop(a);
+        b.read_to_end(&mut got).unwrap();
+        assert_eq!(got, expected);
+    }
+
+    /// A reader blocked on an empty pipe wakes for the write that fills it, and a write to a
+    /// pipe that already holds bytes is read with them.
+    #[test]
+    fn a_waiting_reader_wakes_for_each_first_write() {
+        let (mut a, mut b) = Pipe::pair();
+        let reader = std::thread::spawn(move || {
+            let mut all = Vec::new();
+            let mut out = [0u8; 4];
+            loop {
+                match b.read(&mut out) {
+                    Ok(0) => return all,
+                    Ok(n) => all.extend_from_slice(&out[..n]),
+                    Err(e) => panic!("{e}"),
+                }
+            }
+        });
+        for i in 0..50u8 {
+            a.write_all(&[i, i, i]).unwrap();
+            if i % 7 == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        drop(a);
+        let all = reader.join().unwrap();
+        assert_eq!(all, (0..50u8).flat_map(|i| [i, i, i]).collect::<Vec<_>>());
+    }
+
+    /// Many frames in one read, and a frame cut across reads, come out whole and in order;
+    /// with compression on, the small ones and the compressed ones alike.
+    #[test]
+    fn frames_are_taken_in_order_from_any_reads() {
+        for threshold in [None, Some(64)] {
+            let (a, mut b) = Pipe::pair();
+            let bodies: Vec<Vec<u8>> = (0..300u32)
+                .map(|i| {
+                    let mut body = vec![(i % 100) as u8];
+                    body.extend(std::iter::repeat_n(
+                        (i % 251) as u8,
+                        (i as usize * 37) % 700,
+                    ));
+                    body
+                })
+                .collect();
+            let mut wire = Vec::new();
+            for body in &bodies {
+                wire.extend_from_slice(&frame::encode(body, threshold).unwrap());
+            }
+            // Written in uneven pieces: some frames whole together, others cut in two.
+            let mut at = 0;
+            let mut piece = 1;
+            while at < wire.len() {
+                let end = (at + piece).min(wire.len());
+                b.write_all(&wire[at..end]).unwrap();
+                at = end;
+                piece = piece * 3 % 5000 + 1;
+            }
+            let mut c = Connection::local(a);
+            let t = threshold.map_or(-1, |t| t as i32);
+            c.set_compression(t);
+            for body in &bodies {
+                let (id, payload) = c.recv().unwrap();
+                assert_eq!(id, i32::from(body[0]));
+                assert_eq!(payload, body[1..]);
+            }
+            assert!(c.reader.start <= c.reader.buffer.len());
+        }
+    }
+
+    /// A batch sends the bytes the frames would have sent one by one, encrypted alike, and the
+    /// counters count each frame.
+    #[test]
+    fn a_batch_writes_the_same_bytes_at_once() {
+        let bodies: Vec<Vec<u8>> = (0..40u8)
+            .map(|i| std::iter::repeat_n(i, usize::from(i) * 9 + 1).collect())
+            .collect();
+        let wire = |batched: bool| {
+            let (a, mut b) = Pipe::pair();
+            let mut c = Connection::local(a);
+            c.enable_encryption(&[3; 16]);
+            c.set_compression(64);
+            let (_, mut writer) = c.split();
+            if batched {
+                writer.begin_batch();
+            }
+            for body in &bodies {
+                writer.send(body).unwrap();
+            }
+            writer.end_batch().unwrap();
+            assert_eq!(writer.counters.sent.load(Ordering::Relaxed), 40);
+            let bytes = writer.counters.bytes_out.load(Ordering::Relaxed);
+            drop(writer);
+            let mut out = Vec::new();
+            b.read_to_end(&mut out).unwrap();
+            assert_eq!(out.len() as i64, bytes);
+            out
+        };
+        assert_eq!(wire(true), wire(false));
+        assert_eq!(frame::varint_len(0), 1);
+        assert_eq!(frame::varint_len(127), 1);
+        assert_eq!(frame::varint_len(128), 2);
+        assert_eq!(frame::varint_len(16_383), 2);
+        assert_eq!(frame::varint_len(16_384), 3);
+        assert_eq!(frame::varint_len(frame::MAX_FRAME), 3);
     }
 
     #[test]

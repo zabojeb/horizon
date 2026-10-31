@@ -3,139 +3,55 @@
 //! (UUIDUtil.createOfflinePlayerUUID), the online-mode server hash
 //! (Crypt.digestData) and the shared secret. Only the AES forward cipher is
 //! needed: CFB8 encrypts the shift register in both directions.
+use aes::cipher::{Array, BlockCipherEncrypt, KeyInit};
 use sha1::{Digest, Sha1};
 
-const SBOX: [u8; 256] = {
-    // Generated from the AES field inverse and affine transform at compile time.
-    let mut sbox = [0u8; 256];
-    let mut p: u8 = 1;
-    let mut q: u8 = 1;
-    loop {
-        // p *= 3
-        p = p ^ (p << 1) ^ if p & 0x80 != 0 { 0x1B } else { 0 };
-        // q /= 3
-        q ^= q << 1;
-        q ^= q << 2;
-        q ^= q << 4;
-        if q & 0x80 != 0 {
-            q ^= 0x09;
-        }
-        let x = q ^ q.rotate_left(1) ^ q.rotate_left(2) ^ q.rotate_left(3) ^ q.rotate_left(4);
-        sbox[p as usize] = x ^ 0x63;
-        if p == 1 {
-            break;
-        }
-    }
-    sbox[0] = 0x63;
-    sbox
-};
-
-fn xtime(b: u8) -> u8 {
-    (b << 1) ^ if b & 0x80 != 0 { 0x1B } else { 0 }
-}
-
-/// AES-128 block encryption (FIPS-197).
-#[derive(Clone)]
-pub struct Aes128 {
-    round_keys: [[u8; 16]; 11],
-}
-impl Aes128 {
-    pub fn new(key: &[u8; 16]) -> Self {
-        let mut w = [[0u8; 4]; 44];
-        for i in 0..4 {
-            w[i].copy_from_slice(&key[i * 4..i * 4 + 4]);
-        }
-        let mut rcon = 1u8;
-        for i in 4..44 {
-            let mut t = w[i - 1];
-            if i % 4 == 0 {
-                t = [
-                    SBOX[t[1] as usize] ^ rcon,
-                    SBOX[t[2] as usize],
-                    SBOX[t[3] as usize],
-                    SBOX[t[0] as usize],
-                ];
-                rcon = xtime(rcon);
-            }
-            for j in 0..4 {
-                w[i][j] = w[i - 4][j] ^ t[j];
-            }
-        }
-        let mut round_keys = [[0u8; 16]; 11];
-        for (r, key) in round_keys.iter_mut().enumerate() {
-            for c in 0..4 {
-                key[c * 4..c * 4 + 4].copy_from_slice(&w[r * 4 + c]);
-            }
-        }
-        Self { round_keys }
-    }
-    pub fn encrypt_block(&self, block: &mut [u8; 16]) {
-        let add = |s: &mut [u8; 16], k: &[u8; 16]| s.iter_mut().zip(k).for_each(|(a, b)| *a ^= b);
-        add(block, &self.round_keys[0]);
-        for round in 1..=10 {
-            for b in block.iter_mut() {
-                *b = SBOX[*b as usize];
-            }
-            // ShiftRows (column-major state: byte r + 4c).
-            let s = *block;
-            for c in 0..4 {
-                for r in 0..4 {
-                    block[r + 4 * c] = s[r + 4 * ((c + r) % 4)];
-                }
-            }
-            if round != 10 {
-                for c in 0..4 {
-                    let col = [
-                        block[4 * c],
-                        block[4 * c + 1],
-                        block[4 * c + 2],
-                        block[4 * c + 3],
-                    ];
-                    let all = col[0] ^ col[1] ^ col[2] ^ col[3];
-                    for r in 0..4 {
-                        block[4 * c + r] = col[r] ^ all ^ xtime(col[r] ^ col[(r + 1) % 4]);
-                    }
-                }
-            }
-            add(block, &self.round_keys[round]);
-        }
-    }
-}
-
-/// AES/CFB8 stream state for one direction of a connection.
+/// AES/CFB8 stream state for one direction of a connection. The block cipher is the `aes`
+/// crate's: AES-NI or ARMv8's AES instructions where the CPU has them (detected at run time),
+/// a constant-time software AES elsewhere.
 #[derive(Clone)]
 pub struct Cfb8 {
-    aes: Aes128,
+    aes: aes::Aes128,
     register: [u8; 16],
 }
 impl Cfb8 {
     /// Minecraft uses the 16-byte shared secret as both key and IV.
     pub fn new(key: &[u8; 16], iv: &[u8; 16]) -> Self {
         Self {
-            aes: Aes128::new(key),
+            aes: aes::Aes128::new(&Array::from(*key)),
             register: *iv,
         }
     }
-    fn keystream(&self) -> u8 {
-        let mut block = self.register;
-        self.aes.encrypt_block(&mut block);
-        block[0]
-    }
-    fn shift(&mut self, cipher_byte: u8) {
-        self.register.copy_within(1.., 0);
-        self.register[15] = cipher_byte;
-    }
+    /// Each byte's keystream is the encrypted register of the ciphertext before it, so
+    /// encryption goes one block per byte.
     pub fn encrypt(&mut self, data: &mut [u8]) {
         for b in data {
-            *b ^= self.keystream();
-            self.shift(*b);
+            let mut block = Array::from(self.register);
+            self.aes.encrypt_block(&mut block);
+            *b ^= block[0];
+            self.register.copy_within(1.., 0);
+            self.register[15] = *b;
         }
     }
+    /// The registers of decryption are ciphertext already received, so a run of bytes has all
+    /// its blocks known at once: they are encrypted together, as many in parallel as the CPU
+    /// runs.
     pub fn decrypt(&mut self, data: &mut [u8]) {
-        for b in data {
-            let c = *b;
-            *b ^= self.keystream();
-            self.shift(c);
+        const RUN: usize = 64;
+        let mut window = [0u8; 16 + RUN];
+        let mut blocks = [Array::from([0u8; 16]); RUN];
+        for run in data.chunks_mut(RUN) {
+            let n = run.len();
+            window[..16].copy_from_slice(&self.register);
+            window[16..16 + n].copy_from_slice(run);
+            for (k, block) in blocks[..n].iter_mut().enumerate() {
+                block.copy_from_slice(&window[k..k + 16]);
+            }
+            self.aes.encrypt_blocks(&mut blocks[..n]);
+            for (b, block) in run.iter_mut().zip(&blocks[..n]) {
+                *b ^= block[0];
+            }
+            self.register.copy_from_slice(&window[n..n + 16]);
         }
     }
 }
@@ -268,6 +184,137 @@ pub fn uuid_string(u: u128) -> String {
     )
 }
 
+/// The byte-wise AES (FIPS-197) and CFB8 the game used before the `aes` crate, kept to check
+/// the new one against.
+#[cfg(test)]
+mod reference {
+    pub const SBOX: [u8; 256] = {
+        // Generated from the AES field inverse and affine transform at compile time.
+        let mut sbox = [0u8; 256];
+        let mut p: u8 = 1;
+        let mut q: u8 = 1;
+        loop {
+            // p *= 3
+            p = p ^ (p << 1) ^ if p & 0x80 != 0 { 0x1B } else { 0 };
+            // q /= 3
+            q ^= q << 1;
+            q ^= q << 2;
+            q ^= q << 4;
+            if q & 0x80 != 0 {
+                q ^= 0x09;
+            }
+            let x = q ^ q.rotate_left(1) ^ q.rotate_left(2) ^ q.rotate_left(3) ^ q.rotate_left(4);
+            sbox[p as usize] = x ^ 0x63;
+            if p == 1 {
+                break;
+            }
+        }
+        sbox[0] = 0x63;
+        sbox
+    };
+
+    fn xtime(b: u8) -> u8 {
+        (b << 1) ^ if b & 0x80 != 0 { 0x1B } else { 0 }
+    }
+
+    /// AES-128 block encryption (FIPS-197).
+    pub struct Aes128 {
+        round_keys: [[u8; 16]; 11],
+    }
+    impl Aes128 {
+        pub fn new(key: &[u8; 16]) -> Self {
+            let mut w = [[0u8; 4]; 44];
+            for i in 0..4 {
+                w[i].copy_from_slice(&key[i * 4..i * 4 + 4]);
+            }
+            let mut rcon = 1u8;
+            for i in 4..44 {
+                let mut t = w[i - 1];
+                if i % 4 == 0 {
+                    t = [
+                        SBOX[t[1] as usize] ^ rcon,
+                        SBOX[t[2] as usize],
+                        SBOX[t[3] as usize],
+                        SBOX[t[0] as usize],
+                    ];
+                    rcon = xtime(rcon);
+                }
+                for j in 0..4 {
+                    w[i][j] = w[i - 4][j] ^ t[j];
+                }
+            }
+            let mut round_keys = [[0u8; 16]; 11];
+            for (r, key) in round_keys.iter_mut().enumerate() {
+                for c in 0..4 {
+                    key[c * 4..c * 4 + 4].copy_from_slice(&w[r * 4 + c]);
+                }
+            }
+            Self { round_keys }
+        }
+        pub fn encrypt_block(&self, block: &mut [u8; 16]) {
+            let add =
+                |s: &mut [u8; 16], k: &[u8; 16]| s.iter_mut().zip(k).for_each(|(a, b)| *a ^= b);
+            add(block, &self.round_keys[0]);
+            for round in 1..=10 {
+                for b in block.iter_mut() {
+                    *b = SBOX[*b as usize];
+                }
+                // ShiftRows (column-major state: byte r + 4c).
+                let s = *block;
+                for c in 0..4 {
+                    for r in 0..4 {
+                        block[r + 4 * c] = s[r + 4 * ((c + r) % 4)];
+                    }
+                }
+                if round != 10 {
+                    for c in 0..4 {
+                        let col = [
+                            block[4 * c],
+                            block[4 * c + 1],
+                            block[4 * c + 2],
+                            block[4 * c + 3],
+                        ];
+                        let all = col[0] ^ col[1] ^ col[2] ^ col[3];
+                        for r in 0..4 {
+                            block[4 * c + r] = col[r] ^ all ^ xtime(col[r] ^ col[(r + 1) % 4]);
+                        }
+                    }
+                }
+                add(block, &self.round_keys[round]);
+            }
+        }
+    }
+
+    /// The byte-wise CFB8 the game used before the `aes` crate: the reference.
+    pub struct Cfb8 {
+        aes: Aes128,
+        register: [u8; 16],
+    }
+    impl Cfb8 {
+        pub fn new(key: &[u8; 16], iv: &[u8; 16]) -> Self {
+            Self {
+                aes: Aes128::new(key),
+                register: *iv,
+            }
+        }
+        fn keystream(&self) -> u8 {
+            let mut block = self.register;
+            self.aes.encrypt_block(&mut block);
+            block[0]
+        }
+        fn shift(&mut self, cipher_byte: u8) {
+            self.register.copy_within(1.., 0);
+            self.register[15] = cipher_byte;
+        }
+        pub fn encrypt(&mut self, data: &mut [u8]) {
+            for b in data {
+                *b ^= self.keystream();
+                self.shift(*b);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,6 +328,7 @@ mod tests {
 
     #[test]
     fn sbox_spot_checks() {
+        use reference::SBOX;
         assert_eq!(SBOX[0x00], 0x63);
         assert_eq!(SBOX[0x01], 0x7c);
         assert_eq!(SBOX[0x53], 0xed);
@@ -290,9 +338,51 @@ mod tests {
     #[test]
     fn aes128_fips197_vector() {
         let key: [u8; 16] = hex("000102030405060708090a0b0c0d0e0f").try_into().unwrap();
-        let mut block: [u8; 16] = hex("00112233445566778899aabbccddeeff").try_into().unwrap();
-        Aes128::new(&key).encrypt_block(&mut block);
-        assert_eq!(block.to_vec(), hex("69c4e0d86a7b0430d8cdb78070b4c55a"));
+        let block: [u8; 16] = hex("00112233445566778899aabbccddeeff").try_into().unwrap();
+        let expected = hex("69c4e0d86a7b0430d8cdb78070b4c55a");
+        let mut old = block;
+        reference::Aes128::new(&key).encrypt_block(&mut old);
+        assert_eq!(old.to_vec(), expected);
+        let mut new = Array::from(block);
+        aes::Aes128::new(&Array::from(key)).encrypt_block(&mut new);
+        assert_eq!(new.to_vec(), expected);
+    }
+
+    /// The stream comes out byte for byte as the byte-wise CFB8 made it, for any key, any
+    /// data and any split of it into calls (the decryption's runs straddle them).
+    #[test]
+    fn cfb8_matches_the_bytewise_reference() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..20 {
+            let key: [u8; 16] = std::array::from_fn(|_| next() as u8);
+            let len = (next() % 700) as usize + round;
+            let plain: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            let mut old = plain.clone();
+            reference::Cfb8::new(&key, &key).encrypt(&mut old);
+            let mut new = plain.clone();
+            let mut enc = Cfb8::new(&key, &key);
+            let mut dec = Cfb8::new(&key, &key);
+            let mut at = 0;
+            while at < len {
+                let end = (at + (next() % 150) as usize + 1).min(len);
+                enc.encrypt(&mut new[at..end]);
+                at = end;
+            }
+            assert_eq!(new, old, "round {round}");
+            let mut at = 0;
+            while at < len {
+                let end = (at + (next() % 200) as usize + 1).min(len);
+                dec.decrypt(&mut new[at..end]);
+                at = end;
+            }
+            assert_eq!(new, plain, "round {round}");
+        }
     }
 
     #[test]
