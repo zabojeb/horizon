@@ -302,7 +302,8 @@ pub(super) struct Remote {
     /// holds its abilities from the login on; here the player is made at
     /// the first teleport, which takes them then.
     abilities: Option<play::PlayerAbilities>,
-    loaded_sent: bool,
+    /// `ServerboundPlayerLoadedPacket` went out for this level (the gym waits for it).
+    pub(super) loaded_sent: bool,
     /// `ClientPacketListener.levelLoadTracker`: the loading screen after a login
     /// or respawn, until the player's section is shown.
     pub(super) level_load: horizon_client::level_loading::LevelLoadTracker,
@@ -631,6 +632,8 @@ impl Game<'_> {
         );
         streaming.remote = true;
         streaming.radius = self.settings.render_distance;
+        // `--gym` draws nothing: its sections are never meshed.
+        streaming.mesh = !self.options.gym;
         self.streaming = streaming;
         self.world = World::new(self.res.facts().air, 0);
         self.save = Arc::new(SaveDir::new(
@@ -1650,6 +1653,7 @@ impl Game<'_> {
             );
             streaming.remote = true;
             streaming.radius = self.streaming.radius;
+            streaming.mesh = !self.options.gym;
             self.streaming = streaming;
             let (time, day, weather) = (
                 self.world.game_time,
@@ -2447,6 +2451,12 @@ impl Game<'_> {
             // A native mod's server half to its client half.
             C::CustomPayload(p) if p.channel == horizon_protocol::mod_net::CHANNEL => {
                 self.remote_native_net(&p.data);
+            }
+            // `--gym`: the server thread finished a lockstep tick (game/gym.rs).
+            C::CustomPayload(p) if p.channel == horizon_client::gym::TICK_CHANNEL => {
+                if let Some(tick) = horizon_client::gym::read_tick_payload(&p.data) {
+                    self.gym.marker = self.gym.marker.max(tick);
+                }
             }
             // PingDebugMonitor.onPongReceived.
             C::PongResponse(p) => {

@@ -26,7 +26,7 @@ use std::{
     net::TcpStream,
     sync::{
         Arc, Mutex, PoisonError,
-        atomic::{AtomicI32, AtomicI64, AtomicU32, AtomicUsize, Ordering},
+        atomic::{AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         mpsc::{Receiver, RecvTimeoutError, Sender, channel},
     },
     time::{Duration, Instant},
@@ -1105,7 +1105,10 @@ fn wait_alive<T>(
 fn play(c: Connection, shared: &Arc<Shared>, parts: Parts, address: std::net::SocketAddr) {
     let conn_id = shared.next_id();
     let events = shared.events.clone();
-    let _ = c.reader.set_read_timeout(Some(READ_TIMEOUT));
+    let memory = c.is_memory();
+    if !memory || shared.config.memory_timeout {
+        let _ = c.reader.set_read_timeout(Some(READ_TIMEOUT));
+    }
     let (mut reader, writer) = c.split();
     let (tx, rx) = channel();
     let pending = Arc::new(AtomicUsize::new(0));
@@ -1156,6 +1159,7 @@ fn play(c: Connection, shared: &Arc<Shared>, parts: Parts, address: std::net::So
             &alive,
             required_pack,
             shared.config.rate_limit,
+            memory.then_some(&shared.memory_tick_ends),
         ) {
             Ended::Closed(reason) => reason,
             Ended::PackDeclined(rejected) => {
@@ -1234,6 +1238,7 @@ enum Ended {
 /// Forward the player's packets until the connection ends: why it did, the
 /// id of a required resource pack the player declined (with
 /// `required_pack`), or a rate-limit excess, which disconnects them.
+/// `tick_ends` counts the `ClientTickEnd`s forwarded (the memory connection's).
 fn read_loop(
     reader: &mut ConnReader,
     conn: u32,
@@ -1241,6 +1246,7 @@ fn read_loop(
     alive: &AtomicI64,
     required_pack: bool,
     rate_limit: i32,
+    tick_ends: Option<&AtomicU64>,
 ) -> Ended {
     let mut rate = PacketRate::new(rate_limit, Instant::now());
     loop {
@@ -1268,11 +1274,15 @@ fn read_loop(
                 return Ended::PackDeclined(r.id);
             }
             Ok(p) => {
+                let tick_end = matches!(p, play::Serverbound::ClientTickEnd(_));
                 if events
                     .send(NetEvent::Packet(conn, Box::new(p), payload.len()))
                     .is_err()
                 {
                     return Ended::Closed("server closed".to_owned());
+                }
+                if tick_end && let Some(count) = tick_ends {
+                    count.fetch_add(1, Ordering::Release);
                 }
             }
             // A malformed packet disconnects like vanilla's decoder exception.

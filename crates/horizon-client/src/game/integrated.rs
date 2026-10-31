@@ -172,6 +172,8 @@ pub(super) struct Serving {
     pending: Option<Publish>,
     /// Where the load focus is and how far the player's chunks are.
     load: LoadPhase,
+    /// `--gym`: the window's agent grants each world tick (game/gym.rs).
+    pub(super) lockstep: Option<Arc<horizon_client::gym::Lockstep>>,
 }
 /// The part of `LevelLoadListener` after `prepareLevels`: `PrepareSpawnTask`'s
 /// `LOAD_PLAYER_CHUNKS`.
@@ -226,6 +228,8 @@ struct Launch {
     player: String,
     /// The signed-in account's profile, fetched while the world loads.
     owner_profile: Option<Arc<OwnerProfile>>,
+    /// `--gym`: the gate through which the window's agent steps the world.
+    lockstep: Option<Arc<horizon_client::gym::Lockstep>>,
 }
 
 impl Game<'_> {
@@ -281,6 +285,7 @@ impl Game<'_> {
                         .collect()
                 }))
             }),
+            lockstep: self.gym.lockstep.clone(),
         };
         let mut options = self.options.clone();
         // A server without a console: no local player, no window, no control socket.
@@ -295,6 +300,8 @@ impl Game<'_> {
         options.report = None;
         options.server = None;
         options.world = None;
+        // The gym is the window's: its server thread is an integrated server like any other.
+        options.gym = false;
         self.join_world_rest()?;
         let (res, pack, settings) = (self.res.clone(), self.pack.clone(), self.settings.clone());
         let flags = Arc::new(Flags::default());
@@ -310,11 +317,14 @@ impl Game<'_> {
         let (ready_tx, ready) = channel();
         let (tasks, server_tasks) = channel();
         let server_flags = flags.clone();
+        let gate = launch.lockstep.clone();
         let thread = std::thread::Builder::new()
             .name("Server thread".into())
             .spawn(move || {
                 // MinecraftServer.spin's Thread.setPriority(8).
                 horizon_threads::favour_current();
+                // A stopped server ticks no more: a waiting agent hears it at once.
+                let _closes = gate.map(horizon_client::gym::CloseOnDrop);
                 let result = serve(
                     &res,
                     pack,
@@ -527,8 +537,16 @@ impl Game<'_> {
         }
         let mut next = Instant::now();
         let mut was_paused = false;
+        let lockstep = self.serving.as_ref().and_then(|s| s.lockstep.clone());
         while !flags.stop.load(Ordering::Relaxed) {
             self.run_tasks();
+            if let Some(gate) = &lockstep {
+                // `--gym`: no clock; the agent's client grants each tick.
+                self.gym_server_pass(gate)?;
+                self.apply_publish();
+                self.publish_load_view();
+                continue;
+            }
             if self.agent.hold_server {
                 // Keep servicing control requests so the fixture can release the barrier.
                 // Unlike /tick freeze, no player's queued packets are applied here.
@@ -622,6 +640,8 @@ impl Game<'_> {
             })),
             levels: self.level_shapes,
             owner_profile: launch.owner_profile.clone(),
+            // The gym's client is silent while its agent thinks: no read timeout.
+            memory_timeout: launch.lockstep.is_none(),
             // IntegratedServer.initServer: the MOTD names the owner and the world.
             ..NetConfig::lan(
                 0,
@@ -657,6 +677,7 @@ impl Game<'_> {
             owner,
             pending: None,
             load: LoadPhase::default(),
+            lockstep: launch.lockstep.clone(),
         });
         // MinecraftServer.prepareLevels: no forced chunks to load, so the
         // stage is over at once; the player's chunks come after.

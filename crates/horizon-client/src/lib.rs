@@ -63,6 +63,7 @@ pub mod game_mode_switcher;
 pub mod game_rules_screen;
 pub mod gizmos;
 pub mod gossip;
+pub mod gym;
 pub mod health;
 pub mod heartbeat;
 pub mod hotbar;

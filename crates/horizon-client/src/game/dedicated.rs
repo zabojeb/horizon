@@ -815,6 +815,7 @@ impl Game<'_> {
                 Vec::new()
             },
             owner_profile: None,
+            memory_timeout: true,
         };
         let config = HubConfig {
             allow_flight: props.allow_flight,

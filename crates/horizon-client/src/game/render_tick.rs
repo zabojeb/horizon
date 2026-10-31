@@ -361,6 +361,12 @@ impl Game<'_> {
                 1.0,
             );
         }
+        if self.options.gym {
+            // Nothing is drawn: no particle, rain splash or block animation is simulated.
+            self.particles.clear();
+            self.tick_pickups();
+            return;
+        }
         self.particles.particle_level = self.settings.particles;
         if let Some(e) = eye {
             self.particles.camera = e;

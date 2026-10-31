@@ -257,6 +257,10 @@ impl Server {
     pub fn try_recv(&self) -> Option<Request> {
         self.requests.try_recv().ok()
     }
+    /// The next request, waiting up to `timeout` for one (the gym's loop, which has no frames).
+    pub fn recv_timeout(&self, timeout: std::time::Duration) -> Option<Request> {
+        self.requests.recv_timeout(timeout).ok()
+    }
 }
 
 /// Accept connections on a thread, one more thread per client.

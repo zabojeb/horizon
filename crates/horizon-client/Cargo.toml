@@ -36,6 +36,8 @@ wgpu = { version = "30.0.1", default-features = false, features = ["std", "parki
 winit = "0.30.13"
 pollster = "0.4"
 bytemuck = { version = "1.24", features = ["derive"] }
+# The gym's block-state observations (`gym::encode_ids`).
+base64 = "0.22"
 glam = "0.30"
 png = "0.18"
 sha2 = "0.10.9"

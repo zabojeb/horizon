@@ -41,7 +41,7 @@ use std::{
     net::{SocketAddr, TcpListener, TcpStream},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         mpsc::{Receiver, Sender, channel},
     },
     thread::JoinHandle,
@@ -197,6 +197,10 @@ pub struct NetConfig {
     /// The shapes of the world's levels: their dimension types go to
     /// clients when the world's data packs changed them.
     pub levels: crate::chunk::LevelShapes,
+    /// The memory connection (the window's own, [`Lan::connect_local`]) is closed after 30
+    /// silent seconds, as a network one is. The gym (`--gym`, docs/gym.md) turns it off: its
+    /// client is silent while the agent thinks between steps, and the world waits for it.
+    pub memory_timeout: bool,
 }
 impl NetConfig {
     /// MinecraftServer.enforceSecureProfile.
@@ -229,6 +233,7 @@ impl NetConfig {
             horizon_clients_only: false,
             levels: crate::chunk::LevelShapes::VANILLA,
             owner_profile: None,
+            memory_timeout: true,
         }
     }
 }
@@ -332,8 +337,15 @@ pub struct Shared {
     next: AtomicU32,
     stop: AtomicBool,
     random: Mutex<u64>,
+    /// `ServerboundClientTickEndPacket`s the memory connection has handed to the hub: the gym's
+    /// server ticks once the agent's client's tick is all there (docs/gym.md).
+    memory_tick_ends: AtomicU64,
 }
 impl Shared {
+    /// The memory connection's `ClientTickEnd` packets forwarded so far.
+    pub fn memory_tick_ends(&self) -> u64 {
+        self.memory_tick_ends.load(Ordering::Acquire)
+    }
     /// The registries and tags a new connection is sent.
     pub fn sync(&self) -> Arc<data::SyncData> {
         self.sync.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -532,6 +544,7 @@ impl Lan {
             next: AtomicU32::new(1),
             stop: AtomicBool::new(false),
             random: Mutex::new(crate::server::java_properties::now_millis() as u64 | 1),
+            memory_tick_ends: AtomicU64::new(0),
             config,
         });
         let mut lan = Self {
