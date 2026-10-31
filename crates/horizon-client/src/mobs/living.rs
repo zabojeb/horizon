@@ -247,6 +247,31 @@ impl MobWorld<'_> {
             .map(|shape| shape.boxes().iter().map(|b| b.move_by(offset)).collect())
             .unwrap_or_default()
     }
+    /// Whether `state`'s collision boxes at x, y, z (`block_collision_boxes`, for the state
+    /// already read there) meet `area`, without collecting them.
+    fn collision_meets(
+        &self,
+        state: horizon_world::registry::BlockStateId,
+        [x, y, z]: [i32; 3],
+        area: Aabb,
+    ) -> bool {
+        let mut scene = SceneCollisions {
+            world: self.world,
+            binding: self.collision,
+            subject: None,
+        };
+        let at = horizon_core::position::BlockPos::new(x, y, z);
+        let context = horizon_world::collision_context::CollisionContext::empty(false);
+        let offset = Vec3::new(f64::from(x), f64::from(y), f64::from(z));
+        self.collision
+            .collision_shape_with_context(&mut scene, state, at, &context)
+            .is_ok_and(|shape| {
+                shape
+                    .boxes()
+                    .iter()
+                    .any(|b| b.move_by(offset).intersects(area))
+            })
+    }
     /// `Level.findSupportingBlock`: of the blocks whose collision shape
     /// meets `area`, the one whose centre is nearest `from` (ties: the
     /// greatest by `Vec3i.compareTo`, y then z then x).
@@ -298,11 +323,7 @@ impl MobWorld<'_> {
                     {
                         continue;
                     }
-                    if !self
-                        .block_collision_boxes(x, y, z)
-                        .iter()
-                        .any(|b| b.intersects(area))
-                    {
+                    if !self.collision_meets(state, [x, y, z], area) {
                         continue;
                     }
                     let d = (f64::from(x) + 0.5 - from.x).powi(2)
