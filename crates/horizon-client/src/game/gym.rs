@@ -50,6 +50,9 @@ pub(super) struct Gym {
     pub lockstep: Option<Arc<Lockstep>>,
     /// The last lockstep tick the server thread's marker named.
     pub marker: u64,
+    /// The last sync marker the client read ([`gym::SYNC_CHANNEL`]), and the ones it asked for.
+    pub synced: u64,
+    syncs: u64,
     /// The `ClientTickEnd` packets this client sent to the open world.
     tick_ends: u64,
     config: ObsConfig,
@@ -284,7 +287,10 @@ impl Game<'_> {
             self.gym_console(command)?;
         }
         if !reset.commands.is_empty() {
-            // A teleport may land far away: wait for its terrain as for a join.
+            // What the commands sent reaches the client before anything else happens: a teleport
+            // handled now or during the first quiet tick would start the episode from either of
+            // two states. Then, as the teleport may land far away, its terrain as for a join.
+            self.gym_sync()?;
             self.gym_settle()?;
         }
         let quiet = Action::default();
@@ -345,6 +351,8 @@ impl Game<'_> {
         gate.settle();
         self.gym.lockstep = Some(gate);
         self.gym.marker = 0;
+        self.gym.synced = 0;
+        self.gym.syncs = 0;
         self.gym.tick_ends = 0;
         self.agent_pointer = true;
         let (seed, creative) = (seed.unwrap_or(self.options.seed), self.options.creative);
@@ -376,6 +384,38 @@ impl Game<'_> {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    /// Read the connection until everything the server thread sent so far is handled: it sends
+    /// a sync marker ([`gym::SYNC_CHANNEL`]) behind it, outside any tick, and the client reads up
+    /// to that marker.
+    fn gym_sync(&mut self) -> Result<()> {
+        self.gym.syncs += 1;
+        let target = self.gym.syncs;
+        let server = self
+            .integrated
+            .as_ref()
+            .ok_or("no world is open; send gym-reset")?;
+        let sent = server
+            .call(move |g| g.gym_send_to_owner(gym::SYNC_CHANNEL, target))
+            .ok_or("the server thread did not answer")?;
+        if !sent {
+            return Err("the server has no connection for the player".into());
+        }
+        let deadline = Instant::now() + TICK_TIMEOUT;
+        while self.gym.synced < target {
+            self.poll_remote()?;
+            if self.remote.is_none() {
+                return Err("the client left the world".into());
+            }
+            if Instant::now() > deadline {
+                return Err("the server thread's sync marker did not arrive".into());
+            }
+            if self.gym.synced < target {
+                std::thread::yield_now();
+            }
+        }
+        Ok(())
     }
 
     /// The player is in the world, said so to the server, and its 3x3 chunks are lit.
@@ -570,11 +610,17 @@ impl Game<'_> {
 
     /// After a granted tick: its marker, behind every packet the tick sent.
     fn gym_send_marker(&mut self, tick: u64) {
+        self.gym_send_to_owner(gym::TICK_CHANNEL, tick);
+    }
+
+    /// The server thread's side of a marker: `n` on `channel` to the window's own client, behind
+    /// everything sent to it before. False when the player has no connection here.
+    fn gym_send_to_owner(&mut self, channel: &str, n: u64) -> bool {
         let Some(owner) = self.serving.as_ref().map(|s| s.owner) else {
-            return;
+            return false;
         };
         let Some(host) = self.lan.as_mut() else {
-            return;
+            return false;
         };
         let Some(conn) = host
             .hub
@@ -583,17 +629,18 @@ impl Game<'_> {
             .find(|g| g.uuid == owner)
             .map(|g| g.conn)
         else {
-            return;
+            return false;
         };
         host.hub.send_to(
             conn,
             &horizon_protocol::packets::play::Clientbound::CustomPayload(
                 horizon_protocol::packets::configuration::CustomPayload {
-                    channel: gym::TICK_CHANNEL.into(),
-                    data: gym::tick_payload(tick),
+                    channel: channel.into(),
+                    data: gym::tick_payload(n),
                 },
             ),
         );
+        true
     }
 
     /// The observation: the player as its client knows it, the blocks around it, the nearest

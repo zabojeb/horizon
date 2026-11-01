@@ -23,6 +23,11 @@ pub const PROTOCOL: u32 = 1;
 /// the tick's number ([`tick_payload`]): every packet of that tick is ahead of it on the
 /// connection, so the client has them all once it has handled this one.
 pub const TICK_CHANNEL: &str = "horizon:gym_tick";
+/// The custom payload the server thread sends its own client when the gym asks it to, outside
+/// any tick, with a number of the gym's: everything sent before it (what a reset's commands
+/// changed: a teleport, an inventory) is ahead of it, so the client has it all once it has
+/// handled this one.
+pub const SYNC_CHANNEL: &str = "horizon:gym_sync";
 
 /// The most ticks one step may hold its action for.
 pub const MAX_TICKS: u32 = 200;
@@ -31,11 +36,11 @@ pub const MAX_VOXEL_RADIUS: u32 = 16;
 /// The most entities an observation may list.
 pub const MAX_ENTITIES: usize = 256;
 
-/// The tick marker's data: the tick's number, 8 bytes big-endian.
+/// A marker's data: the tick's number (or the sync's), 8 bytes big-endian.
 pub fn tick_payload(tick: u64) -> Vec<u8> {
     tick.to_be_bytes().to_vec()
 }
-/// The tick a marker names; `None` for data that is not one.
+/// The number a marker names; `None` for data that is not one.
 pub fn read_tick_payload(data: &[u8]) -> Option<u64> {
     Some(u64::from_be_bytes(data.try_into().ok()?))
 }

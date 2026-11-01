@@ -2458,6 +2458,12 @@ impl Game<'_> {
                     self.gym.marker = self.gym.marker.max(tick);
                 }
             }
+            // `--gym`: everything the server thread sent before a reset's sync is here.
+            C::CustomPayload(p) if p.channel == horizon_client::gym::SYNC_CHANNEL => {
+                if let Some(n) = horizon_client::gym::read_tick_payload(&p.data) {
+                    self.gym.synced = self.gym.synced.max(n);
+                }
+            }
             // PingDebugMonitor.onPongReceived.
             C::PongResponse(p) => {
                 let delay = self.debug_millis() - p.time;

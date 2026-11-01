@@ -8,8 +8,10 @@ number of ticks however busy the machine is.
 
 **Status: experimental.** The lockstep gate, the actions, the observations and the Python client are tested
 (`cargo test -p horizon-client --lib gym::`, `--bin horizon-client gym::`, `python3 -m unittest
-tests.test_horizon_gym`, the last against a fake game). The first runs against a real world are still to be
-measured on a machine with prepared resources.
+tests.test_horizon_gym`, the last against a fake game). Measured against a real world on a 64-vCPU AMD EPYC
+7B13 (fast profile, random actions after a warm-up, one tick a step): one game steps 611 times a second, 30x
+real time, in 1.5 GB; 48 games together 17,456 times a second. `tools.horizon_gym.bench`, which counts the first
+2,000 steps with their terrain generation, gives 420.
 
 ## Quick start
 
@@ -83,8 +85,9 @@ answers one JSON line, with `{"error": ...}` on failure (`horizon_client::contro
 folder (so every episode starts from the same terrain), `{"reload": true}` a fresh world with the game's
 `--seed`; with none of them the world goes on and only the player is reset. A dead player respawns. Then
 `commands` run in order on the server's console (`/clear`, `/tp @p 0 100 0`, `/give @p minecraft:stone_axe`,
-`/gamerule ...`), the terrain around the player loads, and `settle_ticks` (1 by default) quiet ticks pass so that
-what the commands changed reaches the client. `config` sets the observation as `gym-config` does. A world the
+`/gamerule ...`), the client reads everything they sent (the server thread sends a `horizon:gym_sync` marker
+behind it), the terrain around wherever the player now stands loads, and `settle_ticks` (1 by default) quiet
+ticks pass. `config` sets the observation as `gym-config` does. A world the
 gym made is deleted by the next reset that opens one, so a long run keeps one world on disk (the last one stays,
 to look at); a `--world` folder that existed before the gym started is never deleted.
 
@@ -115,7 +118,8 @@ to look at); a `--world` folder that existed before the gym started is never del
 | `chat` | chat and system lines since the last observation (death messages among them) |
 
 `gym-config` takes `voxels` (`[rx, ry, rz]`, blocks out from the feet on each axis, at most 16; `[0, 0, 0]` leaves
-them out), `entities` (how many, at most 256), `entity_radius` (blocks), `inventory` and `chat` (on or off). The
+them out), `entities` (how many, at most 256; 0 leaves them out, and `HorizonEnv`'s observation then has no
+`entities` or `entity_mask`), `entity_radius` (blocks), `inventory` and `chat` (on or off). The
 default is `[4, 4, 4]` (9x9x9 blocks), 16 entities within 16 blocks, with the inventory and chat.
 
 ## Making it fast
@@ -137,6 +141,11 @@ draws are vanilla's. What still varies between runs of one seed: when chunk gene
 finishes (a chunk that arrives a tick later changes what spawns near it), and the wall clock where vanilla reads
 it (keep-alives, chunk batch sizes). Episodes from a `template` with the same actions stay close; bit-exact
 replays would need the server to wait for its workers each tick, which no option does yet.
+
+A fresh world places its first player as vanilla does, at a random spot within the `respawn_radius` game rule
+of the world spawn (an unseeded draw), so two worlds of one seed start the player apart. A `/tp` in the reset's
+`commands` gives every episode one start. Measured: 8 resets of one world, each with that `/tp` and then the
+same 30 steps of two ticks, ended at the same position to the last bit.
 
 ## What is next
 
