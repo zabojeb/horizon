@@ -10,6 +10,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from tools.horizon_gym import client as gym_client
 from tools.horizon_gym import env as gym_env
@@ -37,8 +38,9 @@ OBS = {
 class FakeGame:
     """Answers gym requests as the game does: one JSON line per line, `error` on failure."""
 
-    def __init__(self, tcp=False):
+    def __init__(self, tcp=False, errors=()):
         self.requests = []
+        self.errors = set(errors)
         self.dir = tempfile.TemporaryDirectory()
         root = Path(self.dir.name)
         if tcp:
@@ -59,6 +61,8 @@ class FakeGame:
     def answer(self, line):
         word, _, body = line.partition(' ')
         self.requests.append((word, body))
+        if word in self.errors:
+            return {'error': f'{word} failed'}
         if word == 'gym-info':
             return {'protocol': 1, 'block_states': 10, 'voxel_order': 'yzx', 'max_ticks': 200}
         if word == 'gym-palette':
@@ -238,6 +242,44 @@ class EnvTests(unittest.TestCase):
         if getattr(env, 'observation_space', None) is not None:
             self.assertTrue(env.observation_space.contains(obs))
         env.close()
+
+    def test_no_entities(self):
+        try:
+            import numpy  # noqa: F401
+        except ImportError:
+            self.skipTest('numpy')
+        env = gym_env.HorizonEnv(socket=str(self.game.path), voxels=(1, 0, 0), entities=0)
+        obs, _ = env.reset()
+        self.assertNotIn('entities', obs)
+        self.assertNotIn('entity_mask', obs)
+        self.assertEqual(json.loads(self.game.requests[-1][1])['config']['entities'], 0)
+        if getattr(env, 'observation_space', None) is not None:
+            self.assertNotIn('entities', env.observation_space.spaces)
+            self.assertTrue(env.observation_space.contains(obs))
+        env.close()
+
+    def test_a_failed_start_stops_its_game(self):
+        game = FakeGame(errors={'gym-palette'})
+        stopped = []
+
+        class Process:
+            def __init__(self, **_options):
+                pass
+
+            def start(self):
+                return gym_client.GymClient(game.path, timeout=10)
+
+            def stop(self, client=None):
+                stopped.append(True)
+                client.close()
+
+        try:
+            with mock.patch.object(gym_env, 'GameProcess', Process):
+                with self.assertRaises(gym_client.GymError):
+                    gym_env.HorizonEnv(game={'seed': 1}, raw=True)
+            self.assertEqual(stopped, [True])
+        finally:
+            game.close()
 
 
 class LaunchTests(unittest.TestCase):

@@ -4,8 +4,8 @@
 (`socket=`). Its action is a dict of buttons (0 or 1), a `camera` turn in degrees
 (`[yaw, pitch]`) and a `hotbar` slot (0 keeps the slot, 1 to 9 select one). Its observation
 is a dict of numpy arrays: the block states around the player, its state, inventory and the
-nearest entities. `raw=True` returns the game's JSON instead, and needs neither numpy nor
-Gymnasium.
+nearest entities (none with `entities=0`). `raw=True` returns the game's JSON instead, and
+needs neither numpy nor Gymnasium.
 """
 
 from __future__ import annotations
@@ -95,14 +95,6 @@ class HorizonEnv(_Base):
         self.raw = raw
         if not raw and np is None:
             raise ImportError('HorizonEnv needs numpy unless raw=True')
-        self.process: Optional[GameProcess] = None
-        if client is not None:
-            self.client = client
-        elif socket is not None:
-            self.client = GymClient(socket)
-        else:
-            self.process = GameProcess(**(game or {}))
-            self.client = self.process.start()
         self.config = {'voxels': [int(v) for v in voxels], 'entities': int(entities),
                        'entity_radius': float(entity_radius), 'inventory': True, 'chat': True}
         self.frame_skip = int(frame_skip)
@@ -111,16 +103,31 @@ class HorizonEnv(_Base):
         self.template = template
         self.new_world_each_reset = new_world_each_reset
         self.reward_fn = reward or (lambda _previous, _obs: 0.0)
-        self.info = self.client.info()
-        self.items = {name: i + 1 for i, name in enumerate(self.client.palette('items'))}
-        self.entity_types = {name: i + 1 for i, name in enumerate(self.client.palette('entities'))}
         self._blocks: Optional[list] = None
         self._last: Optional[dict] = None
         self._steps = 0
         self._opened = False
-        if spaces is not None and not raw:
-            self.action_space = self._action_space()
-            self.observation_space = self._observation_space()
+        self.process: Optional[GameProcess] = None
+        if client is not None:
+            self.client = client
+        elif socket is not None:
+            self.client = GymClient(socket)
+        else:
+            self.process = GameProcess(**(game or {}))
+            self.client = self.process.start()
+        try:
+            self.info = self.client.info()
+            self.items = {name: i + 1 for i, name in enumerate(self.client.palette('items'))}
+            self.entity_types = {name: i + 1 for i, name in enumerate(self.client.palette('entities'))}
+            if spaces is not None and not raw:
+                self.action_space = self._action_space()
+                self.observation_space = self._observation_space()
+        except BaseException:
+            # A game this environment started would outlive it: stop it before giving up (a
+            # client the caller passed stays theirs).
+            if client is None:
+                self.close()
+            raise
 
     # Spaces -------------------------------------------------------------------------------
     def _voxel_shape(self) -> tuple:
@@ -136,7 +143,7 @@ class HorizonEnv(_Base):
     def _observation_space(self):
         n = self.config['entities']
         big = float(3.0e7)
-        return spaces.Dict({
+        parts = {
             'voxels': spaces.Box(0, max(1, self.info['block_states'] - 1), shape=self._voxel_shape(),
                                  dtype=np.uint32),
             'position': spaces.Box(-big, big, shape=(3,), dtype=np.float64),
@@ -145,9 +152,12 @@ class HorizonEnv(_Base):
             'status': spaces.Box(-big, big, shape=(len(STATUS),), dtype=np.float32),
             'selected': spaces.Discrete(10),
             'inventory': spaces.Box(0, max(len(self.items), 99) + 1, shape=(41, 2), dtype=np.int32),
-            'entities': spaces.Box(-big, big, shape=(n, len(ENTITY)), dtype=np.float32),
-            'entity_mask': spaces.MultiBinary(n),
-        })
+        }
+        # `entities=0` leaves the entities out (a MultiBinary of 0 is not a space).
+        if n:
+            parts['entities'] = spaces.Box(-big, big, shape=(n, len(ENTITY)), dtype=np.float32)
+            parts['entity_mask'] = spaces.MultiBinary(n)
+        return spaces.Dict(parts)
 
     # Episode ------------------------------------------------------------------------------
     def block_palette(self) -> list:
@@ -205,15 +215,7 @@ class HorizonEnv(_Base):
         for i, slot in enumerate((obs.get('inventory') or [])[:41]):
             if slot:
                 inventory[i] = (self.items.get(slot[0], 0), slot[1])
-        n = self.config['entities']
-        entities = np.zeros((n, len(ENTITY)), dtype=np.float32)
-        mask = np.zeros(n, dtype=np.int8)
-        for i, e in enumerate((obs.get('entities') or [])[:n]):
-            dx, dy, dz = e.get('offset', (0, 0, 0))
-            entities[i] = (self.entity_types.get(e.get('type'), 0), dx, dy, dz, e.get('distance', 0),
-                           e.get('health', 0) or 0)
-            mask[i] = 1
-        return {
+        out = {
             'voxels': voxels,
             'position': np.asarray(player.get('pos', (0.0, 0.0, 0.0)), dtype=np.float64),
             'velocity': np.asarray(player.get('vel', (0.0, 0.0, 0.0)), dtype=np.float32),
@@ -221,6 +223,15 @@ class HorizonEnv(_Base):
             'status': np.asarray(status, dtype=np.float32),
             'selected': int(player.get('selected', 1)),
             'inventory': inventory,
-            'entities': entities,
-            'entity_mask': mask,
         }
+        n = self.config['entities']
+        if n:
+            entities = np.zeros((n, len(ENTITY)), dtype=np.float32)
+            mask = np.zeros(n, dtype=np.int8)
+            for i, e in enumerate((obs.get('entities') or [])[:n]):
+                dx, dy, dz = e.get('offset', (0, 0, 0))
+                entities[i] = (self.entity_types.get(e.get('type'), 0), dx, dy, dz, e.get('distance', 0),
+                               e.get('health', 0) or 0)
+                mask[i] = 1
+            out['entities'], out['entity_mask'] = entities, mask
+        return out
