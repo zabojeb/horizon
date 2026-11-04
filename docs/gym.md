@@ -144,8 +144,9 @@ replays would need the server to wait for its workers each tick, which no option
 
 A fresh world places its first player as vanilla does, at a random spot within the `respawn_radius` game rule
 of the world spawn (an unseeded draw), so two worlds of one seed start the player apart. A `/tp` in the reset's
-`commands` gives every episode one start. Measured: 8 resets of one world, each with that `/tp` and then the
-same 30 steps of two ticks, ended at the same position to the last bit.
+`commands` gives every episode one start. Measured: 8 resets of one world, and 8 fresh worlds of one seed,
+each with that `/tp` and then the same 30 steps of two ticks, ended at the same position to the last bit (with
+the default `settle_ticks`).
 
 ## What is next
 
